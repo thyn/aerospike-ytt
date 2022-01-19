@@ -1,0 +1,275 @@
+#@ load("@ytt:data", "data")
+#@ replicaId = str(data.values.replica)
+#@ def labels():
+app: aerospike
+replica: #@ replicaId
+#@ end
+
+#@ name=data.values.namespace + "-" +  replicaId
+#@ name_exporter=data.values.namespace + "-exporter-" +  replicaId
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: #@ name
+  namespace:  #@ data.values.namespace
+  labels:
+    replica: #@ str(data.values.replica)
+spec:
+  selector:
+    matchLabels:  #@  labels()
+  serviceName: aerospike
+  replicas: 1
+  updateStrategy:
+    type: RollingUpdate
+  podManagementPolicy: OrderedReady
+  template:
+    metadata:
+      labels:  #@  labels()
+    spec:
+#@ if data.values.hostNetwork:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+#@ end
+      terminationGracePeriodSeconds: 300
+      containers:
+      
+      - name: aerospike
+        imagePullPolicy: Always
+        image: #@ data.values.image
+
+
+        resources:
+          requests:
+            memory: #@ data.values.resourcesRequestsMemory
+            cpu: #@ data.values.resourcesRequestsCpu
+          limits:
+            memory: #@ data.values.resourcesLimitsMemory
+            cpu: #@ data.values.resourcesLimitsCpu
+        ports:
+        - containerPort: 3000
+          name: aero-clients
+        - containerPort: 3002
+          name: aero-mesh
+        - containerPort: 3003
+          name: aero-info
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - "while true; do finished=0; for part in $( asadm --no-config-file -e 'asinfo -v statistics -l' | grep migrate_partitions_remaining | cut -d= -f2); do if [ $part != 0 ]; then finished=0; break; fi; finished=1; done; if [ $finished != 1 ]; then sleep 15; else exit 0; fi; done"
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "asinfo -v build"
+          initialDelaySeconds: 10
+          timeoutSeconds: 60
+          periodSeconds: 60
+          successThreshold: 1
+          failureThreshold: 30
+        readinessProbe:
+          tcpSocket:
+              port: 3000
+          initialDelaySeconds: 10
+          timeoutSeconds: 60
+          periodSeconds: 60
+          successThreshold: 1
+          failureThreshold: 30
+        volumeMounts:
+        - name: confdir
+          mountPath: /etc/aerospike
+        volumeDevices: 
+#@ if data.values.blockSsd:
+#@ for i in range(len(data.values.blockSsds)):
+        - name:  #@ "aerospike-ssd-" + str(i)
+          devicePath: #@ data.values.blockSsds[i]
+#@ end
+#@ end
+        env:
+#@ if data.values.blockSsd:
+#@ for i in range(len(data.values.blockSsds)):
+        - name: #@ "SSD" + str(i)
+          value: #@ data.values.blockSsds[i]
+#@ end
+#@ end
+        - name: CLUSTERNAME
+          value: #@ data.values.clusterName
+#@ if len( data.values.ip)>0:
+        - name: HOSTADDRESS
+          value: #@ data.values.ip[int(data.values.replica)-1]
+        - name: HOSTPORT
+          value:  #@ data.values.externalPortPrefix + str(data.values.replica)
+#@ end
+        - name: SERVICE_PORT
+          value: #@ data.values.servicePort
+        - name: HB_ADDRESS
+          value: #@ data.values.hbAddress
+        - name: HB_PORT
+          value: #@ data.values.hbPort
+        - name: FABRIC_ADDRESS
+          value: #@ data.values.fabricAddress   
+        - name: FABRIC_PORT
+          value: #@ data.values.fabricPort
+        - name: INFO_ADDRESS
+          value:  #@ data.values.infoAddress
+        - name: INFO_PORT
+          value: #@ data.values.infoPort          
+        - name: NAMESPACE
+          value: #@ data.values.clusterNamespace
+        - name: REPL_FACTOR
+          value: #@ data.values.replicationFactor
+        - name: MEM_GB
+          value: #@ data.values.memGb
+        - name: DEFAULT_TTL
+          value: #@ data.values.defaultTtl
+        - name: NSUP_PERIOD
+          value: #@ data.values.nsupPeriod
+        - name: WRITEBLOCKSIZE
+          value: #@ data.values.writeBlockSize        
+        - name: MY_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MY_POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: MY_POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      - name: aerospike-prometheus-exporter
+        image: "aerospike/aerospike-prometheus-exporter:1.4.0"
+        ports:
+          - containerPort: 9145
+            name: exporter         
+#@ if len(data.values.nodeSelectors)>0:
+      nodeSelector:
+        kubernetes.io/hostname:  #@ data.values.nodeSelectors[int(data.values.replica)-1]
+   #@ end
+      initContainers:
+      - name: aerospike-init
+        image: aerospike/aerospike-kubernetes-init:1.2.2
+        volumeMounts:
+        - name: confdir
+          mountPath: /etc/aerospike
+        - name: initconfigs
+          mountPath: /configs
+        env:    
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+#@ if data.values.hostNetwork:
+        - name: HOST_NETWORK
+          value: "true"
+#@ end
+        - name: AUTO_GENERATE_NODE_IDS
+          value: "false"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SERVICE
+          value: aerospike
+      volumes:
+      - name: confdir
+        emptyDir: {}
+      - name: initconfigs
+        configMap:
+          name: aerospike-conf
+  volumeClaimTemplates:
+#@ if data.values.blockSsd:
+#@ for i in range(len(data.values.blockSsds)):
+  - metadata:
+      name: #@ "aerospike-ssd-" + str(i)
+    spec:
+      volumeMode: Block
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: #@ data.values.storageClassName
+      resources:
+        requests:
+          storage: #@ data.values.storageSizes[i]
+#@ end
+#@ end
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: #@ name
+  namespace:  #@ data.values.namespace
+spec:
+  ports:
+    - name: client
+      protocol: TCP
+      port: 3000
+      targetPort: 3000
+  selector:  #@  labels()
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: aerospike
+  namespace: #@ data.values.namespace
+spec:
+  ports:
+    - name: aero-client
+      protocol: TCP
+      port: 3000
+      targetPort: 3000
+    - name: aero-mesh
+      protocol: TCP
+      port: 3002
+      targetPort: 3002
+    - name: aero-info
+      protocol: TCP
+      port: 3003
+      targetPort: 3003
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: aerospike
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: #@ name_exporter
+  namespace:  #@ data.values.namespace
+  labels:
+    app: #@ name_exporter
+spec:
+  ports:
+    - name: exporter
+      protocol: TCP
+      port: 9145
+      targetPort: 9145
+  selector:  #@  labels()
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+---    
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    app: #@ name_exporter
+  name: #@ "aerospike-sm-" +  replicaId
+  namespace:  #@ data.values.namespace
+spec:
+  endpoints:
+  - interval: 30s
+    port: exporter
+  selector:
+    matchLabels:
+      app: #@ name_exporter
+
